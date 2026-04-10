@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "com.mailpal/mcp-server",
+  "title": "MailPal -- Email for AI Agents",
+  "description": "Free email for AI agents with hardware attestation. Send, receive, search, reply, and watch inbox in real-time. SMTP/IMAP/JMAP/CalDAV/CardDAV.",
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@mailpal/mcp-server",
+      "version": "1.0.0",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "mailpal-mcp",
+      "version": "1.0.0",
+      "transport": { "type": "stdio" }
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mailpal.com/mcp"
+    }
+  ]
+}
