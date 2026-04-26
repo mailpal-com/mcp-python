@@ -986,36 +986,60 @@ async def _handle_mailpal_delete_emails_operation(params: dict[str, Any]) -> str
   _jmap_account_id = "default"
 
   if is_permanent_deletion:
-    method_calls = [
-      ["Email/set", {
-        "accountId": _jmap_account_id,
-        "destroy": message_ids_to_process,
-      }, "delete"],
-    ]
-  else:
-    trash_query_and_update_calls = [
-      ["Mailbox/query", {
-        "accountId": _jmap_account_id,
-        "filter": {"role": "trash"},
-      }, "find_trash"],
-    ]
-    for idx, msg_id in enumerate(message_ids_to_process):
-      trash_query_and_update_calls.append(
-        ["Email/set", {
+    api_response = await send_authenticated_request_to_mailpal_rest_api(
+      "/jmap", "POST", {
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [
+          ["Email/set", {
+            "accountId": _jmap_account_id,
+            "destroy": message_ids_to_process,
+          }, "delete"],
+        ],
+      }, None, sdk_token.access_token,
+    )
+    return json.dumps(api_response, indent=2, default=str)
+
+  trash_lookup_response = await send_authenticated_request_to_mailpal_rest_api(
+    "/jmap", "POST", {
+      "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+      "methodCalls": [
+        ["Mailbox/query", {
           "accountId": _jmap_account_id,
-          "update": {
-            msg_id: {
-              "mailboxIds": {"#": True},
-            },
-          },
-        }, f"move_{idx}"],
-      )
-    method_calls = trash_query_and_update_calls
+          "filter": {"role": "trash"},
+        }, "find_trash"],
+        ["Mailbox/get", {
+          "accountId": _jmap_account_id,
+          "#ids": {"resultOf": "find_trash", "name": "Mailbox/query", "path": "/ids"},
+          "properties": ["id"],
+        }, "get_trash"],
+      ],
+    }, None, sdk_token.access_token,
+  )
+
+  trash_responses = trash_lookup_response.get("methodResponses", [])
+  trash_mailbox_id = None
+  for entry in trash_responses:
+    if entry[0] == "Mailbox/get":
+      mailbox_list = entry[1].get("list", [])
+      if mailbox_list:
+        trash_mailbox_id = mailbox_list[0]["id"]
+
+  if not trash_mailbox_id:
+    return json.dumps({"error": "Could not find Trash folder on this JMAP server."})
+
+  email_updates = {}
+  for msg_id in message_ids_to_process:
+    email_updates[msg_id] = {"mailboxIds": {trash_mailbox_id: True}}
 
   api_response = await send_authenticated_request_to_mailpal_rest_api(
     "/jmap", "POST", {
       "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-      "methodCalls": method_calls,
+      "methodCalls": [
+        ["Email/set", {
+          "accountId": _jmap_account_id,
+          "update": email_updates,
+        }, "trash_emails"],
+      ],
     }, None, sdk_token.access_token,
   )
   return json.dumps(api_response, indent=2, default=str)
@@ -1037,36 +1061,50 @@ async def _handle_mailpal_move_emails_operation(
   sdk_token = oneid.get_token()
 
   _jmap_account_id = "default"
-  mailbox_query_response = await send_authenticated_request_to_mailpal_rest_api(
+  _friendly_name_to_jmap_role = {
+    "trash": "trash", "deleted": "trash", "deleted items": "trash",
+    "inbox": "inbox",
+    "sent": "sent", "sent items": "sent", "sent mail": "sent",
+    "drafts": "drafts", "draft": "drafts",
+    "junk": "junk", "spam": "junk", "junk mail": "junk",
+    "archive": "archive",
+  }
+
+  all_mailboxes_response = await send_authenticated_request_to_mailpal_rest_api(
     "/jmap", "POST", {
       "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
       "methodCalls": [
-        ["Mailbox/query", {
-          "accountId": _jmap_account_id,
-          "filter": {"name": target_folder_name},
-        }, "find_mailbox"],
         ["Mailbox/get", {
           "accountId": _jmap_account_id,
-          "#ids": {"resultOf": "find_mailbox", "name": "Mailbox/query", "path": "/ids"},
-          "properties": ["id", "name"],
-        }, "get_mailbox"],
+          "properties": ["id", "name", "role"],
+        }, "all_mailboxes"],
       ],
     }, None, sdk_token.access_token,
   )
 
-  mailbox_results = mailbox_query_response.get("methodResponses", [])
+  mailbox_results = all_mailboxes_response.get("methodResponses", [])
+  all_mailboxes = mailbox_results[0][1].get("list", []) if mailbox_results else []
+
   target_mailbox_id = None
-  for response_entry in mailbox_results:
-    if response_entry[0] == "Mailbox/get":
-      mailbox_list = response_entry[1].get("list", [])
-      if mailbox_list:
-        target_mailbox_id = mailbox_list[0]["id"]
+  mapped_role = _friendly_name_to_jmap_role.get(target_folder_name.lower())
+  if mapped_role:
+    for mb in all_mailboxes:
+      if mb.get("role") == mapped_role:
+        target_mailbox_id = mb["id"]
+        break
+  if not target_mailbox_id:
+    lower_target = target_folder_name.lower()
+    for mb in all_mailboxes:
+      if mb.get("name", "").lower() == lower_target:
+        target_mailbox_id = mb["id"]
+        break
 
   if not target_mailbox_id:
+    available_names = ", ".join(mb.get("name", "?") for mb in all_mailboxes)
     return _format_gateway_error_response_as_json(
       error_code="folder_not_found",
       error_message=f"Folder '{target_folder_name}' not found.",
-      fix_instruction="Use a valid folder name like 'Archive', 'Trash', 'Sent', 'Drafts', 'INBOX'.",
+      fix_instruction=f"Available folders: {available_names}. You can also use common names like Trash, Inbox, Sent, Drafts, Junk, Archive.",
       readme_documentation_text=readme_text,
     )
 
