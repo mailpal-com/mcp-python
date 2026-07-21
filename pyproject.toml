@@ -37,7 +37,11 @@ classifiers = [
 ]
 dependencies = [
   "mcp>=1.27.0",
+  # httpx stays here (async SSE/REST); floor httpcore because <1.0.9
+  # breaks HTTPS (same end-user-install exposure the oneid SDK had
+  # before it went stdlib-only in 1.5.0).
   "httpx>=0.27.0",
+  "httpcore>=1.0.9",
   "oneid>=1.3.8",
 ]
 
