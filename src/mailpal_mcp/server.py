@@ -27,17 +27,22 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 import oneid
+from oneid import airs_http_message_signatures
 import oneid.mailpal
 import oneid.devices
 import oneid.credential_pointers
 import oneid.helper
 
 MAILPAL_REST_API_BASE_URL = os.environ.get("MAILPAL_API_URL", "https://mailpal.com/api/v1")
-MAILPAL_BEARER_AUTH_TOKEN = os.environ.get("MAILPAL_TOKEN", "")
+# There is no static bearer token: 1ID tokens are sender-constrained (cnf.jwk),
+# so every MailPal call is signed with the enrolled key through the oneid SDK.
+if os.environ.get("MAILPAL_TOKEN"):
+  import sys as _sys
+  print("mailpal-mcp: MAILPAL_TOKEN is ignored -- MailPal accepts only sender-constrained "
+        "1ID tokens; this server uses your oneid enrollment to sign each request.", file=_sys.stderr)
 
 inbox_sse_background_task: asyncio.Task[None] | None = None
 subscribed_inbox_resource_uri: str | None = None
-bearer_token_for_active_sse_inbox_connection: str = ""
 pending_inbox_state_change_futures: list[asyncio.Future[str]] = []
 captured_mcp_session_for_background_notifications: Any = None
 registered_email_arrival_callbacks: list[dict[str, Any]] = []
@@ -174,26 +179,34 @@ async def send_authenticated_request_to_mailpal_rest_api(
   http_method: str = "GET",
   json_request_body: dict[str, Any] | None = None,
   url_query_parameters: dict[str, str] | None = None,
-  bearer_token_for_this_request: str | None = None,
+  sdk_token_for_this_request: Any = None,
 ) -> dict[str, Any]:
-  """Send an authenticated HTTP request to the MailPal REST API."""
-  full_request_url = f"{MAILPAL_REST_API_BASE_URL}{api_endpoint_path}"
+  """Send an authenticated request to the MailPal REST API, sender-constrained:
+  Authorization + an RFC 9421 signature by the agent's enrolled key over the
+  exact method, URL and body (registry-04 "HTTP Message Signatures")."""
+  from urllib.parse import urlencode
 
-  effective_bearer_token = bearer_token_for_this_request or MAILPAL_BEARER_AUTH_TOKEN
+  sdk_token = sdk_token_for_this_request or oneid.get_token()
+  full_request_url = f"{MAILPAL_REST_API_BASE_URL}{api_endpoint_path}"
+  if url_query_parameters:
+    full_request_url += ("&" if "?" in full_request_url else "?") + urlencode(url_query_parameters)
+  request_body_bytes = json.dumps(json_request_body).encode("utf-8") if json_request_body is not None else None
   http_request_headers: dict[str, str] = {
     "Accept": "application/json",
-    "User-Agent": "mailpal-mcp-python/1.1.0",
+    "User-Agent": "mailpal-mcp-python/1.2.0",
+    "Authorization": sdk_token.authorization_header_value,
   }
-  if effective_bearer_token:
-    http_request_headers["Authorization"] = f"Bearer {effective_bearer_token}"
+  if request_body_bytes is not None:
+    http_request_headers["Content-Type"] = "application/json"
+  http_request_headers.update(airs_http_message_signatures.sign_request_with_token(
+    http_method, full_request_url, http_request_headers, request_body_bytes, sdk_token))
 
   async with httpx.AsyncClient() as http_client:
     http_response = await http_client.request(
       method=http_method,
       url=full_request_url,
       headers=http_request_headers,
-      json=json_request_body,
-      params=url_query_parameters,
+      content=request_body_bytes,
     )
 
   parsed_response_json: dict[str, Any] = http_response.json()
@@ -678,16 +691,21 @@ async def _start_background_sse_listener_for_inbox_event_notifications() -> None
     reconnect_delay = 1.0
     while True:
       try:
-        effective_sse_token = bearer_token_for_active_sse_inbox_connection or MAILPAL_BEARER_AUTH_TOKEN
+        # a fresh token + signature per (re)connection: signatures live 60 s
+        sse_sdk_token = oneid.get_token()
+        sse_url = f"{MAILPAL_REST_API_BASE_URL}/inbox/events"
+        sse_headers = {
+          "Authorization": sse_sdk_token.authorization_header_value,
+          "Accept": "text/event-stream",
+          "Cache-Control": "no-cache",
+        }
+        sse_headers.update(airs_http_message_signatures.sign_request_with_token(
+          "GET", sse_url, sse_headers, None, sse_sdk_token))
         async with httpx.AsyncClient() as http_client:
           async with http_client.stream(
             "GET",
-            f"{MAILPAL_REST_API_BASE_URL}/inbox/events",
-            headers={
-              "Authorization": f"Bearer {effective_sse_token}",
-              "Accept": "text/event-stream",
-              "Cache-Control": "no-cache",
-            },
+            sse_url,
+            headers=sse_headers,
             timeout=None,
           ) as sse_stream_response:
             if not sse_stream_response.is_success:
@@ -967,7 +985,7 @@ async def _handle_mailpal_search_emails_operation(params: dict[str, Any]) -> str
     "/jmap", "POST", {
       "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
       "methodCalls": method_calls,
-    }, None, sdk_token.access_token,
+    }, None, sdk_token,
   )
   return json.dumps(api_response, indent=2, default=str)
 
@@ -995,7 +1013,7 @@ async def _handle_mailpal_delete_emails_operation(params: dict[str, Any]) -> str
             "destroy": message_ids_to_process,
           }, "delete"],
         ],
-      }, None, sdk_token.access_token,
+      }, None, sdk_token,
     )
     return json.dumps(api_response, indent=2, default=str)
 
@@ -1013,7 +1031,7 @@ async def _handle_mailpal_delete_emails_operation(params: dict[str, Any]) -> str
           "properties": ["id"],
         }, "get_trash"],
       ],
-    }, None, sdk_token.access_token,
+    }, None, sdk_token,
   )
 
   trash_responses = trash_lookup_response.get("methodResponses", [])
@@ -1040,7 +1058,7 @@ async def _handle_mailpal_delete_emails_operation(params: dict[str, Any]) -> str
           "update": email_updates,
         }, "trash_emails"],
       ],
-    }, None, sdk_token.access_token,
+    }, None, sdk_token,
   )
   return json.dumps(api_response, indent=2, default=str)
 
@@ -1079,7 +1097,7 @@ async def _handle_mailpal_move_emails_operation(
           "properties": ["id", "name", "role"],
         }, "all_mailboxes"],
       ],
-    }, None, sdk_token.access_token,
+    }, None, sdk_token,
   )
 
   mailbox_results = all_mailboxes_response.get("methodResponses", [])
@@ -1121,14 +1139,14 @@ async def _handle_mailpal_move_emails_operation(
           "update": email_updates,
         }, "move_emails"],
       ],
-    }, None, sdk_token.access_token,
+    }, None, sdk_token,
   )
   return json.dumps(api_response, indent=2, default=str)
 
 
 async def _handle_mailpal_subscribe_to_inbox_operation() -> str:
   """Handle the subscribe operation: start SSE listener for new-mail events."""
-  global subscribed_inbox_resource_uri, bearer_token_for_active_sse_inbox_connection
+  global subscribed_inbox_resource_uri
   global captured_mcp_session_for_background_notifications
 
   try:
@@ -1153,7 +1171,6 @@ async def _handle_mailpal_subscribe_to_inbox_operation() -> str:
     pass
 
   subscribed_inbox_resource_uri = f"mailpal://inbox/{agent_identifier_from_jwt_subject_claim}"
-  bearer_token_for_active_sse_inbox_connection = effective_token
 
   await _start_background_sse_listener_for_inbox_event_notifications()
 
@@ -1355,7 +1372,7 @@ async def mailpal_gateway_tool(
       sdk_token = oneid.get_token()
       api_response = await send_authenticated_request_to_mailpal_rest_api(
         f"/inbox/{quote(effective_params['message_id'], safe='')}",
-        bearer_token_for_this_request=sdk_token.access_token,
+        sdk_token_for_this_request=sdk_token,
       )
       return json.dumps(api_response, indent=2)
 
@@ -1380,7 +1397,7 @@ async def mailpal_gateway_tool(
         "/jmap", "POST", {
           "using": using,
           "methodCalls": effective_params["method_calls"],
-        }, None, sdk_token.access_token,
+        }, None, sdk_token,
       )
       return json.dumps(api_response, indent=2)
 
@@ -1463,6 +1480,10 @@ def oneid_gateway_tool(
         "access_token": token.access_token,
         "token_type": token.token_type,
         "expires_at": str(token.expires_at),
+        "sender_constrained": True,
+        "note": ("1ID tokens are bound to your enrolled key (cnf.jwk): services that verify "
+                 "them require an RFC 9421 signature by that key on every request, so this "
+                 "token alone is refused. Use the oneid SDK (it signs for you)."),
       }, indent=2)
 
     if operation == "sign_challenge":
