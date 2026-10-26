@@ -193,7 +193,7 @@ async def send_authenticated_request_to_mailpal_rest_api(
   request_body_bytes = json.dumps(json_request_body).encode("utf-8") if json_request_body is not None else None
   http_request_headers: dict[str, str] = {
     "Accept": "application/json",
-    "User-Agent": "mailpal-mcp-python/1.2.0",
+    "User-Agent": "mailpal-mcp-python/2.0.0",
     "Authorization": sdk_token.authorization_header_value,
   }
   if request_body_bytes is not None:

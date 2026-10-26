@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mailpal-mcp"
-version = "1.2.0"
+version = "2.0.0"
 description = "MCP server for MailPal -- free email for AI agents with hardware attestation"
 readme = "README.md"
 license = "Apache-2.0"
@@ -42,7 +42,7 @@ dependencies = [
   # before it went stdlib-only in 1.5.0).
   "httpx>=0.27.0",
   "httpcore>=1.0.9",
-  "oneid>=3.1.1",  # sender-constrained 1ID tokens (OWN-038)
+  "oneid>=4.0.0",  # 4.0.0: REG-03 TPM ceremony + draft -03 email attestation; 3.x cannot enroll a TPM at the live Registrar
 ]
 
 [project.scripts]
